@@ -1,0 +1,31 @@
+services:
+  redis-cache:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: >
+      redis-server
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+      --tcp-keepalive 300
+      --tcp-backlog 511
+      --io-threads 4
+      --activedefrag yes
+      --active-defrag-threshold-lower 10
+      --active-defrag-threshold-upper 100
+      --active-defrag-cycle-min 25
+      --active-defrag-cycle-max 75
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  redis-data:

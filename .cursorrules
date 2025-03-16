@@ -1,0 +1,1 @@
+Never mock or patch when testing. Write simple tests that are easy to understand. Never use fixtures.
