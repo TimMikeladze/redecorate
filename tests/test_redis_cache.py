@@ -1,18 +1,25 @@
+import os
 import time
+from collections.abc import Generator
 from datetime import datetime
+from typing import Any, Callable, TypeVar
 
+import psycopg
 import pytest
 import redis
 
-from src.redecorate.redis_cache import (
+from src.redecorate import (
     CacheConfig,
     KeyValueStorageBackend,
     MessagePackSerializer,
     redecorate,
 )
 
+T = TypeVar("T")
+CachedFunction = Callable[..., T]
 
-def setup_redis():
+
+def setup_redis() -> bool:
     """Setup Redis connection and clear test database"""
     redis_client = redis.Redis(host="localhost", port=6379, db=0)
     try:
@@ -28,12 +35,55 @@ def setup_redis():
 
 
 @pytest.fixture(autouse=True)
-def clean_redis():
+def clean_redis() -> None:
     """Clean Redis before each test"""
     setup_redis()
 
 
-def test_basic_caching():
+@pytest.fixture
+def pg_connection() -> Generator[psycopg.Connection[tuple[Any, ...]], None, None]:
+    """Create a PostgreSQL connection for testing."""
+    conn = psycopg.connect(
+        host=os.getenv("POSTGRES_HOST", "localhost"),
+        port=int(os.getenv("POSTGRES_PORT", "5432")),
+        user=os.getenv("POSTGRES_USER", "postgres"),
+        password=os.getenv("POSTGRES_PASSWORD", "postgres"),
+        dbname=os.getenv("POSTGRES_DB", "postgres"),
+    )
+
+    # Create test table
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS test_table (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """
+        )
+        # Insert test data
+        cur.execute(
+            """
+            INSERT INTO test_table (name) VALUES
+            ('Alice'),
+            ('Bob'),
+            ('Charlie')
+            ON CONFLICT DO NOTHING
+        """
+        )
+    conn.commit()
+
+    yield conn
+
+    # Cleanup
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS test_table")
+    conn.commit()
+    conn.close()
+
+
+def test_basic_caching() -> None:
     # Setup Redis connection and cache config
     config = CacheConfig(
         host="localhost",
@@ -48,7 +98,7 @@ def test_basic_caching():
     # Define a simple function to cache
     call_count = 0
 
-    @cache(ttl=5)
+    @cache(ttl=5)  # type: ignore[call-arg]
     def expensive_operation(x: int) -> int:
         nonlocal call_count
         call_count += 1
@@ -70,10 +120,10 @@ def test_basic_caching():
     assert call_count == 2
 
     # Clean up
-    expensive_operation.clear()
+    expensive_operation.clear()  # type: ignore[attr-defined]
 
 
-def test_cache_expiration():
+def test_cache_expiration() -> None:
     config = CacheConfig(
         host="localhost",
         port=6379,
@@ -86,7 +136,7 @@ def test_cache_expiration():
 
     call_count = 0
 
-    @cache(ttl=1)  # 1 second TTL
+    @cache(ttl=1)  # type: ignore[call-arg]
     def get_timestamp() -> int:
         nonlocal call_count
         call_count += 1
@@ -110,10 +160,10 @@ def test_cache_expiration():
     assert call_count == 2
 
     # Clean up
-    get_timestamp.clear()
+    get_timestamp.clear()  # type: ignore[attr-defined]
 
 
-def test_complex_data_types():
+def test_complex_data_types() -> None:
     config = CacheConfig(
         host="localhost",
         port=6379,
@@ -126,8 +176,8 @@ def test_complex_data_types():
 
     call_count = 0
 
-    @cache(ttl=5)
-    def get_complex_data() -> dict:
+    @cache(ttl=5)  # type: ignore[call-arg]
+    def get_complex_data() -> dict[str, Any]:
         nonlocal call_count
         call_count += 1
         return {
@@ -155,10 +205,10 @@ def test_complex_data_types():
     assert call_count == 1
 
     # Clean up
-    get_complex_data.clear()
+    get_complex_data.clear()  # type: ignore[attr-defined]
 
 
-def test_cache_invalidation():
+def test_cache_invalidation() -> None:
     config = CacheConfig(
         host="localhost",
         port=6379,
@@ -171,8 +221,8 @@ def test_cache_invalidation():
 
     call_count = 0
 
-    @cache(ttl=30)
-    def get_data(key: str) -> dict:
+    @cache(ttl=30)  # type: ignore[call-arg]
+    def get_data(key: str) -> dict[str, Any]:
         nonlocal call_count
         call_count += 1
         return {"key": key, "count": call_count}
@@ -183,7 +233,7 @@ def test_cache_invalidation():
     assert call_count == 1
 
     # Invalidate the cache for this specific key
-    get_data.invalidate("test")
+    get_data.invalidate("test")  # type: ignore[attr-defined]
 
     # Next call should recalculate
     result2 = get_data("test")
@@ -191,9 +241,155 @@ def test_cache_invalidation():
     assert call_count == 2
 
     # Clear all cache entries
-    get_data.clear()
+    get_data.clear()  # type: ignore[attr-defined]
 
     # Next call should recalculate again
     result3 = get_data("test")
     assert result3["count"] == 3
     assert call_count == 3
+
+
+def test_memory_caching() -> None:
+    """Test that memory caching works correctly."""
+    config = CacheConfig(
+        host="localhost",
+        port=6379,
+        db=0,
+        prefix="test",
+        storage_backend=KeyValueStorageBackend(
+            MessagePackSerializer(),
+            maxsize=10,  # Small cache size for testing
+            ttl=5,
+        ),
+    )
+
+    cache = redecorate(config)
+    call_count = 0
+
+    @cache()  # type: ignore[call-arg]
+    def get_value(key: str) -> dict[str, Any]:
+        nonlocal call_count
+        call_count += 1
+        return {"key": key, "timestamp": time.time()}
+
+    # First call - should miss both caches
+    result1 = get_value("test1")
+    assert call_count == 1
+
+    # Second call to same key - should hit memory cache
+    result2 = get_value("test1")
+    assert result2 == result1
+    assert call_count == 1
+
+    # Force clear memory cache by filling it with other values
+    for i in range(15):  # More than maxsize=10
+        get_value(f"fill{i}")
+
+    # Call original key - should hit Redis but miss memory
+    result3 = get_value("test1")
+    assert result3 == result1  # Same data from Redis
+    assert call_count == 16  # Only new keys caused function calls
+
+    # Wait for TTL to expire
+    time.sleep(6)
+
+    # Call after expiration - should miss both caches
+    result4 = get_value("test1")
+    assert result4 != result1
+    assert call_count == 17
+
+    # Clean up
+    get_value.clear()  # type: ignore[attr-defined]
+
+
+def test_custom_cache_params() -> None:
+    """Test that custom cache parameters are respected."""
+    config = CacheConfig(
+        host="localhost",
+        port=6379,
+        db=0,
+        prefix="test",
+        storage_backend=KeyValueStorageBackend(
+            MessagePackSerializer(),
+            maxsize=5,  # Small cache size for testing
+            ttl=2,  # Short TTL for testing
+        ),
+    )
+
+    cache = redecorate(config)
+    call_count = 0
+
+    @cache()  # type: ignore[call-arg]
+    def get_value(key: str) -> dict[str, Any]:
+        nonlocal call_count
+        call_count += 1
+        return {"key": key, "timestamp": time.time()}
+
+    # Fill memory cache
+    for i in range(7):  # More than maxsize
+        get_value(f"key{i}")
+
+    assert call_count == 7
+
+    # This should hit Redis but miss memory (due to LRU eviction)
+    result = get_value("key0")
+    assert call_count == 7  # No increase because it hit Redis
+    assert result["key"] == "key0"  # Verify the result
+
+    # Wait for TTL to expire
+    time.sleep(2.1)
+
+    # This should miss both caches
+    result = get_value("key0")
+    assert call_count == 8
+    assert result["key"] == "key0"  # Verify the result
+
+    # Clean up
+    get_value.clear()  # type: ignore[attr-defined]
+
+
+def test_postgres_caching(pg_connection: psycopg.Connection[tuple[Any, ...]]) -> None:
+    """Test caching PostgreSQL query results."""
+    config = CacheConfig(
+        host="localhost",
+        port=6379,
+        db=0,
+        prefix="test",
+        storage_backend=KeyValueStorageBackend(MessagePackSerializer()),
+    )
+
+    cache = redecorate(config)
+    query_count = 0
+
+    @cache(ttl=5)  # type: ignore[call-arg]
+    def get_user_by_id(user_id: int) -> dict[str, Any]:
+        nonlocal query_count
+        query_count += 1
+
+        with pg_connection.cursor() as cur:
+            cur.execute("SELECT id, name, created_at FROM test_table WHERE id = %s", (user_id,))
+            result = cur.fetchone()
+            if result is None:
+                return {}
+
+            return {"id": result[0], "name": result[1], "created_at": result[2]}
+
+    try:
+        # First call - should query the database
+        user1 = get_user_by_id(1)
+        assert user1["name"] == "Alice"
+        assert query_count == 1
+
+        # Second call - should use cache
+        user1_cached = get_user_by_id(1)
+        assert user1_cached == user1
+        assert query_count == 1  # Query count shouldn't increase
+
+        # Different user - should query database again
+        user2 = get_user_by_id(2)
+        assert user2["name"] == "Bob"
+        assert query_count == 2
+    finally:
+        # Clean up
+        get_user_by_id.clear()  # type: ignore[attr-defined]
+        pg_connection.commit()  # Ensure transaction is committed before cleanup
