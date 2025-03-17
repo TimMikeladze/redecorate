@@ -4,6 +4,8 @@ from collections.abc import Generator
 from datetime import datetime
 from typing import Any, Callable, TypeVar
 
+import numpy as np
+import pandas as pd
 import psycopg
 import pytest
 import redis
@@ -393,3 +395,54 @@ def test_postgres_caching(pg_connection: psycopg.Connection[tuple[Any, ...]]) ->
         # Clean up
         get_user_by_id.clear()  # type: ignore[attr-defined]
         pg_connection.commit()  # Ensure transaction is committed before cleanup
+
+
+def test_pandas_dataframe_caching() -> None:
+    """Test caching pandas DataFrame results."""
+    config = CacheConfig(
+        host="localhost",
+        port=6379,
+        db=0,
+        prefix="test",
+        storage_backend=KeyValueStorageBackend(MessagePackSerializer()),
+    )
+
+    cache = redecorate(config)
+    computation_count = 0
+
+    @cache(ttl=5)  # type: ignore[call-arg]
+    def process_dataframe(size: int) -> pd.DataFrame:
+        nonlocal computation_count
+        computation_count += 1
+
+        # Create a sample DataFrame with some calculations
+        df = pd.DataFrame({
+            "A": np.random.rand(size),
+            "B": np.random.rand(size),
+            "C": np.random.rand(size),
+        })
+
+        # Perform some calculations
+        df["D"] = df["A"] + df["B"]
+        df["E"] = df["C"] * 2
+
+        return df
+
+    # First call - should compute the DataFrame
+    df1 = process_dataframe(1000)
+    assert isinstance(df1, pd.DataFrame)
+    assert len(df1) == 1000
+    assert computation_count == 1
+
+    # Second call with same parameters - should use cache
+    df2 = process_dataframe(1000)
+    assert computation_count == 1  # Count shouldn't increase
+    pd.testing.assert_frame_equal(df1, df2)  # DataFrames should be identical
+
+    # Different size parameter - should compute new DataFrame
+    df3 = process_dataframe(500)
+    assert len(df3) == 500
+    assert computation_count == 2
+
+    # Clean up
+    process_dataframe.clear()  # type: ignore[attr-defined]

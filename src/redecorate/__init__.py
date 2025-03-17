@@ -1,6 +1,9 @@
 import json
 import logging
+import os
+import threading
 import time
+import uuid
 import zlib
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
@@ -19,6 +22,7 @@ from typing import (
 )
 
 import msgpack
+import pandas as pd
 import redis
 
 logger = logging.getLogger("redecorate")
@@ -198,6 +202,11 @@ class MessagePackSerializer:
                 "class": obj.__class__.__name__,
                 "value": obj.value,
             }
+        elif hasattr(obj, "__class__") and obj.__class__.__name__ == "DataFrame":
+            return {
+                "__dataframe__": True,
+                "data": obj.to_dict(orient="split"),
+            }
         elif is_dataclass(obj) and not isinstance(obj, type):
             return {k: self._convert_value(v) for k, v in asdict(obj).items()}
         elif isinstance(obj, dict):
@@ -230,6 +239,8 @@ class MessagePackSerializer:
             elif obj.get("__enum__"):
                 # You'd need more logic here to recreate the enum
                 return obj["value"]
+            elif obj.get("__dataframe__"):
+                return pd.DataFrame(**obj["data"])
             return {k: self._process_obj(v) for k, v in obj.items()}
         elif isinstance(obj, list):
             return [self._process_obj(v) for v in obj]
@@ -576,20 +587,21 @@ class CacheDecorator:
         self.redis_client = redis_client
         self.config = config
         self.conn_manager = RedisConnectionManager(config.connection_pool)
+        self.lock_manager = Lock(redis_client)
 
     def _get_client(self) -> redis.Redis:
         """Get an optimized Redis client for the current operation."""
         return self.conn_manager.get_client()
 
-    def acquire_lock(self, key: str, ttl: int = 10) -> bool:
-        """Acquire a distributed lock using Redis."""
+    def acquire_lock(self, key: str, ttl: int = 10) -> tuple[bool, Optional[str]]:
+        """Acquire a distributed lock using Redis with owner identification."""
         lock_key = f"lock:{key}"
-        return bool(self._get_client().set(lock_key, "1", nx=True, ex=ttl))
+        return self.lock_manager.acquire(lock_key, ttl_ms=ttl * 1000)
 
-    def release_lock(self, key: str) -> bool:
-        """Release a distributed lock."""
+    def release_lock(self, key: str, lock_identifier: str) -> bool:
+        """Release a distributed lock if we still own it."""
         lock_key = f"lock:{key}"
-        return bool(self._get_client().delete(lock_key))
+        return self.lock_manager.release(lock_key, lock_identifier)
 
     def _handle_cache_miss(
         self,
@@ -649,11 +661,12 @@ class CacheDecorator:
                         return cast(DataT, cached_result)
 
                     # Cache miss - acquire lock to compute value
-                    if self.acquire_lock(key, lock_ttl):
+                    lock_success, lock_id = self.acquire_lock(key, lock_ttl)
+                    if lock_success and lock_id:
                         try:
                             return self._handle_cache_miss(key, func, args, kwargs, ttl, start_time)
                         finally:
-                            self.release_lock(key)
+                            self.release_lock(key, lock_id)
 
                     # Someone else is computing the value, wait and retry
                     cached_result = self._retry_get_cached_value(
@@ -707,6 +720,188 @@ class CacheDecorator:
             int,
             self.config.storage_backend.clear_pattern(client, pattern, scan_batch_size=self.config.scan_batch_size),
         )
+
+
+class NoRedisInstanceError(ValueError):
+    """Raised when no Redis instances are provided to Lock."""
+
+    pass
+
+
+class Lock:
+    """
+    Unified distributed locking implementation that supports both single and multi-instance Redis setups.
+    Always includes lock owner identification for safety.
+    """
+
+    def __init__(
+        self,
+        redis_instances: Union[redis.Redis, list[redis.Redis]],
+        retry_count: int = 3,
+        retry_delay_ms: int = 200,
+        clock_drift_factor: float = 0.01,
+    ):
+        """
+        Initialize Lock with either a single Redis instance or multiple instances for Redlock.
+
+        Args:
+            redis_instances: Single Redis client or list of Redis clients for Redlock
+            retry_count: Number of retries for lock acquisition
+            retry_delay_ms: Delay between retries in milliseconds
+            clock_drift_factor: Safety factor for clock drift (default 1%)
+        """
+        # Convert single instance to list for unified handling
+        self.redis_instances = [redis_instances] if isinstance(redis_instances, redis.Redis) else redis_instances
+        if not self.redis_instances:
+            raise NoRedisInstanceError
+
+        self.retry_count = retry_count
+        self.retry_delay_ms = retry_delay_ms
+        self.clock_drift_factor = clock_drift_factor
+
+        # Generate process and thread identifiers for lock ownership
+        self.process_id = str(os.getpid())
+        self.thread_id = str(threading.get_ident())
+
+        # Flag to indicate if we're in single-instance mode
+        self.single_instance = len(self.redis_instances) == 1
+
+    def _generate_lock_id(self) -> str:
+        """Generate a unique lock identifier combining process, thread and random UUID."""
+        random_id = str(uuid.uuid4())
+        return f"{self.process_id}:{self.thread_id}:{random_id}"
+
+    def _acquire_lock(self, redis_instance: redis.Redis, key: str, value: str, ttl_ms: int) -> bool:
+        """
+        Try to acquire lock on a single Redis instance with owner identification.
+
+        Args:
+            redis_instance: Redis client instance
+            key: Lock key
+            value: Lock value (owner identifier)
+            ttl_ms: Time-to-live in milliseconds
+        """
+        try:
+            return bool(redis_instance.set(key, value, nx=True, px=ttl_ms))
+        except redis.RedisError:
+            logger.warning("Failed to acquire lock on Redis instance", exc_info=True)
+            return False
+
+    def _release_lock(self, redis_instance: redis.Redis, key: str, value: str) -> bool:
+        """
+        Release lock on a single Redis instance using Lua script for atomic operation.
+        Only releases if the lock is still owned by us.
+        """
+        release_script = """
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("del", KEYS[1])
+        else
+            return 0
+        end
+        """
+        try:
+            return bool(redis_instance.eval(release_script, 1, key, value))
+        except redis.RedisError:
+            logger.warning("Failed to release lock on Redis instance", exc_info=True)
+            return False
+
+    def acquire(self, key: str, ttl_ms: int = 10000) -> tuple[bool, Optional[str]]:
+        """
+        Try to acquire lock using either single-instance or Redlock algorithm.
+
+        Args:
+            key: Lock key
+            ttl_ms: Time-to-live in milliseconds
+
+        Returns:
+            Tuple of (success, lock_identifier)
+        """
+        lock_identifier = self._generate_lock_id()
+
+        # Fast path for single instance
+        if self.single_instance:
+            success = self._acquire_lock(self.redis_instances[0], key, lock_identifier, ttl_ms)
+            return success, lock_identifier if success else None
+
+        # Redlock algorithm for multiple instances
+        drift_time = int(ttl_ms * self.clock_drift_factor) + 2
+
+        for _ in range(self.retry_count):
+            start_time = int(time.time() * 1000)
+            n_success = 0
+
+            # Try to acquire lock on all instances
+            for redis_instance in self.redis_instances:
+                if self._acquire_lock(redis_instance, key, lock_identifier, ttl_ms):
+                    n_success += 1
+
+            elapsed_time = int(time.time() * 1000) - start_time
+
+            # Check if we acquired locks from majority of instances and have enough time left
+            if n_success >= (len(self.redis_instances) // 2 + 1) and elapsed_time < ttl_ms - drift_time:
+                return True, lock_identifier
+
+            # If we failed to acquire the majority, release all locks
+            self.release(key, lock_identifier)
+
+            # Wait before retry
+            time.sleep(self.retry_delay_ms / 1000.0)
+
+        return False, None
+
+    def release(self, key: str, lock_identifier: str) -> bool:
+        """
+        Release acquired locks from all Redis instances.
+        Only releases if we still own the lock.
+
+        Args:
+            key: Lock key
+            lock_identifier: The unique identifier returned from acquire()
+        """
+        if self.single_instance:
+            return self._release_lock(self.redis_instances[0], key, lock_identifier)
+
+        success = True
+        for redis_instance in self.redis_instances:
+            if not self._release_lock(redis_instance, key, lock_identifier):
+                success = False
+        return success
+
+    def extend(self, key: str, lock_identifier: str, extend_ms: int) -> bool:
+        """
+        Extend the TTL of an existing lock if we still own it.
+
+        Args:
+            key: Lock key
+            lock_identifier: The unique identifier returned from acquire()
+            extend_ms: Additional time in milliseconds
+        """
+        extend_script = """
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("pexpire", KEYS[1], ARGV[2])
+        else
+            return 0
+        end
+        """
+
+        if self.single_instance:
+            try:
+                return bool(self.redis_instances[0].eval(extend_script, 1, key, lock_identifier, extend_ms))
+            except redis.RedisError:
+                logger.warning("Failed to extend lock", exc_info=True)
+                return False
+
+        # For Redlock, we need majority agreement
+        n_success = 0
+        for redis_instance in self.redis_instances:
+            try:
+                if bool(redis_instance.eval(extend_script, 1, key, lock_identifier, extend_ms)):
+                    n_success += 1
+            except redis.RedisError:
+                logger.warning("Failed to extend lock on Redis instance", exc_info=True)
+                continue
+
+        return n_success >= (len(self.redis_instances) // 2 + 1)
 
 
 def redecorate(
